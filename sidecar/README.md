@@ -1,7 +1,7 @@
 # iPhone bridge
 
 The app communicates with `ios_bridge.py` over a private JSONL child-process pipe.
-The runtime pins pymobiledevice3 11.12.4 (GPL-3.0-or-later). The Python API was
+The runtime pins pymobiledevice3 11.44.0 (GPL-3.0-or-later). The Python API was
 checked against that published wheel, including its DVT acknowledgement and
 connection-disconnected event implementations.
 
@@ -32,8 +32,11 @@ to the Electron packaging workflow.
 - iOS 17.4 or later, USB data cable, phone unlocked and trusted, Developer Mode on.
 - macOS uses its Apple USB service. Windows needs Apple USB services; upstream
   documents installing iTunes from the Microsoft Store.
-- First preparation may download/cache the personalized developer image and
-  request a device-specific ticket from Apple. It does not install a phone app,
+- First preparation may download/cache the developer disk image and request a
+  device-specific ticket from Apple. Preparation uses upstream `auto_mount` over
+  a short-lived RSD tunnel, so newer iOS releases get the board-agnostic Cryptex1
+  image instead of the PersonalizedDMG (whose manifest lists only known boards).
+  An already mounted image or installed DDI cryptex is reused without remounting. It does not install a phone app,
   change the phone passcode, enable Wi-Fi, or enable Developer Mode silently.
 - No Wi-Fi discovery or fallback is allowed. Every lockdown connection sets
   `connection_type="USB"` and the exact selected UDID. Services inherit that

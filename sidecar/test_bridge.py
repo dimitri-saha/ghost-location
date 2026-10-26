@@ -372,5 +372,92 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lockdown.__aexit__.await_count, 2)
 
 
+    def prepare_mocks(self, mounted=False, version="27.0"):
+        lockdown = AsyncMock()
+        lockdown.paired = True
+        lockdown.product_version = version
+        lockdown.get_developer_mode_status.return_value = True
+        lockdown.__aenter__.return_value = lockdown
+        mounter = AsyncMock()
+        mounter.__aenter__.return_value = mounter
+        mounter.is_image_mounted.return_value = mounted
+        rsd = SimpleNamespace(udid="00008030-0000000000000001")
+        tunnel = SimpleNamespace(aopen=AsyncMock(return_value=rsd), aclose=AsyncMock())
+        patches = [
+            patch.object(bridge_module, "connection_lockdown", AsyncMock(return_value=lockdown)),
+            patch.object(bridge_module, "PersonalizedImageMounter", return_value=mounter),
+            patch.object(bridge_module.userspace_tunnel, "UserspaceRsdTunnel", return_value=tunnel),
+            patch.object(bridge_module, "fetch_cryptex_ddi"),
+            patch.object(bridge_module, "fetch_personalized_ddi"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return rsd, tunnel
+
+    async def test_prepare_skips_tunnel_when_personalized_image_is_mounted(self):
+        _rsd, tunnel = self.prepare_mocks(mounted=True)
+        with patch.object(bridge_module, "auto_mount", AsyncMock()) as mount:
+            self.assertTrue((await bridge_module.Bridge().prepare("00008030-0000000000000001"))["ready"])
+        tunnel.aopen.assert_not_awaited()
+        mount.assert_not_awaited()
+
+    async def test_prepare_auto_mounts_over_rsd_tunnel_and_closes_it(self):
+        rsd, tunnel = self.prepare_mocks()
+        bridge = bridge_module.Bridge()
+        bridge.ddi_cryptex_installed = AsyncMock(return_value=False)
+        with patch.object(bridge_module, "auto_mount", AsyncMock()) as mount:
+            self.assertTrue((await bridge.prepare("00008030-0000000000000001"))["ready"])
+        mount.assert_awaited_once_with(rsd)
+        bridge_module.fetch_cryptex_ddi.assert_called_once()
+        bridge_module.userspace_tunnel.UserspaceRsdTunnel.assert_called_once_with(
+            serial="00008030-0000000000000001", autopair=False, remotepairing_fallback=False)
+        tunnel.aclose.assert_awaited_once()
+
+    async def test_prepare_does_not_remount_installed_cryptex(self):
+        _rsd, tunnel = self.prepare_mocks()
+        bridge = bridge_module.Bridge()
+        bridge.ddi_cryptex_installed = AsyncMock(return_value=True)
+        with patch.object(bridge_module, "auto_mount", AsyncMock()) as mount:
+            self.assertTrue((await bridge.prepare("00008030-0000000000000001"))["ready"])
+        mount.assert_not_awaited()
+        tunnel.aclose.assert_awaited_once()
+
+    async def test_prepare_treats_already_mounted_as_success(self):
+        _rsd, tunnel = self.prepare_mocks(version="18.5")
+        bridge = bridge_module.Bridge()
+        bridge.ddi_cryptex_installed = AsyncMock(return_value=False)
+        error = bridge_module.AlreadyMountedError("mounted")
+        with patch.object(bridge_module, "auto_mount", AsyncMock(side_effect=error)):
+            self.assertTrue((await bridge.prepare("00008030-0000000000000001"))["ready"])
+        bridge_module.fetch_personalized_ddi.assert_called_once()
+        tunnel.aclose.assert_awaited_once()
+
+    async def test_prepare_rejects_mismatched_tunnel_device_and_closes_it(self):
+        rsd, tunnel = self.prepare_mocks()
+        rsd.udid = "00008030-0000000000000002"
+        with patch.object(bridge_module, "auto_mount", AsyncMock()) as mount:
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                await bridge_module.Bridge().prepare("00008030-0000000000000001")
+        mount.assert_not_awaited()
+        tunnel.aclose.assert_awaited_once()
+
+    async def test_prepare_never_opens_second_tunnel_beside_another_session(self):
+        _rsd, tunnel = self.prepare_mocks()
+        bridge, _session, _ = self.connected_bridge()
+        with self.assertRaisesRegex(RuntimeError, "before preparing another device"):
+            await bridge.prepare("00008030-0000000000000001")
+        tunnel.aopen.assert_not_awaited()
+
+    async def test_cryptex_check_matches_ddi_identifier(self):
+        rsd = SimpleNamespace()
+        installed = [SimpleNamespace(identifier="other"), SimpleNamespace(identifier=bridge_module.DDI_CRYPTEX_IDENTIFIER)]
+        service = SimpleNamespace(copy_installed=AsyncMock(return_value=installed))
+        with patch.object(bridge_module, "uses_cryptex_image", return_value=True), \
+             patch.object(bridge_module, "CryptexdService", return_value=service):
+            self.assertTrue(await bridge_module.Bridge().ddi_cryptex_installed(rsd))
+        with patch.object(bridge_module, "uses_cryptex_image", return_value=False):
+            self.assertFalse(await bridge_module.Bridge().ddi_cryptex_installed(rsd))
+
 if __name__ == "__main__":
     unittest.main()

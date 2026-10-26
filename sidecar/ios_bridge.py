@@ -15,7 +15,7 @@ import re
 import sys
 
 PROTOCOL_VERSION = 1
-PINNED_VERSION = "11.12.4"
+PINNED_VERSION = "11.44.0"
 REFRESH_INTERVAL = 1.0
 LOCATION_ACK_TIMEOUT = 5.0
 PROTOCOL_OUT = sys.stdout
@@ -31,7 +31,9 @@ from pymobiledevice3.remote import userspace_tunnel
 from pymobiledevice3.remote.tunnel_service import CoreDeviceTunnelProxy
 from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
 from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
-from pymobiledevice3.services.mobile_image_mounter import PersonalizedImageMounter, fetch_personalized_ddi
+from pymobiledevice3.services.cryptexd import DDI_CRYPTEX_IDENTIFIER, CryptexdService, fetch_cryptex_ddi
+from pymobiledevice3.services.mobile_image_mounter import (
+    CRYPTEX_IMAGE_MIN_VERSION, PersonalizedImageMounter, auto_mount, fetch_personalized_ddi, uses_cryptex_image)
 
 
 def emit(value):
@@ -156,20 +158,55 @@ class Bridge:
         return {"enabled": True, "message": "Wi-Fi enabled. Keep both devices on the same network, then choose Wi-Fi in Ghost."}
 
     async def prepare(self, udid):
+        ready = {"ready": True, "message": "iPhone developer services are ready."}
+        session = self.session
+        if session and session["udid"] == udid and self.session_usable(session):
+            # A live DVT stream proves the image is mounted, and upstream allows
+            # only one userspace tunnel per process.
+            return ready
         async with await connection_lockdown(udid, autopair=True) as lockdown:
             if not lockdown.paired:
                 raise RuntimeError("Unlock the iPhone and trust this computer.")
-            if Version(lockdown.product_version) < Version("17.4"):
+            version = Version(lockdown.product_version)
+            if version < Version("17.4"):
                 raise RuntimeError("This version requires iOS 17.4 or later.")
             if not await lockdown.get_developer_mode_status():
                 raise RuntimeError("Enable Developer Mode in Settings → Privacy & Security, restart, and confirm it.")
+            # A mounted PersonalizedDMG is visible over plain lockdown; skip the tunnel.
             async with PersonalizedImageMounter(lockdown) as mounter:
-                if not await mounter.is_image_mounted("Personalized"):
-                    # Keep potentially slow first-run download off the session event loop.
-                    image, manifest, trustcache = await asyncio.to_thread(fetch_personalized_ddi)
-                    with suppress(AlreadyMountedError):
-                        await mounter.mount(image, manifest, trustcache)
-        return {"ready": True, "message": "iPhone developer services are ready."}
+                if await mounter.is_image_mounted(PersonalizedImageMounter.IMAGE_TYPE):
+                    return ready
+        # The userspace tunnel runs on this event loop, so download (or validate the
+        # cache) in a thread first; auto_mount then reads the cache synchronously.
+        await asyncio.to_thread(fetch_cryptex_ddi if version >= CRYPTEX_IMAGE_MIN_VERSION else fetch_personalized_ddi)
+        if self.session:
+            raise RuntimeError("Restore the active iPhone location before preparing another device.")
+        if self.transport_error:
+            raise RuntimeError("The previous iPhone transport did not close completely. Reset the connection to retry.")
+        # auto_mount personalizes the Cryptex1 DDI for any board, but it needs an
+        # RSD tunnel (plain lockdown raises RSDRequiredError on newer iOS).
+        tunnel = userspace_tunnel.UserspaceRsdTunnel(serial=udid, autopair=False, remotepairing_fallback=False)
+        rsd = await tunnel.aopen()
+        try:
+            if rsd.udid != udid:
+                raise RuntimeError("Connected iPhone does not match the selected device.")
+            if not await self.ddi_cryptex_installed(rsd):
+                with suppress(AlreadyMountedError):
+                    await auto_mount(rsd)
+        finally:
+            try:
+                await asyncio.wait_for(tunnel.aclose(), 8)
+            except BaseException as error:
+                # Same process-global tunnel rule as close_session().
+                self.transport_error = error
+                raise
+        return ready
+
+    async def ddi_cryptex_installed(self, rsd):
+        if not uses_cryptex_image(rsd):
+            return False
+        installed = await CryptexdService(rsd).copy_installed()
+        return any(cryptex.identifier == DDI_CRYPTEX_IDENTIFIER for cryptex in installed)
 
     async def connect(self, udid):
         if self.transport_error:
@@ -213,10 +250,15 @@ class Bridge:
         return session
 
     def session_usable(self, session):
-        # _closed is pinned 11.12.4's immediate close flag; wait_disconnected()
+        # _closed is the pinned DTXConnection's immediate close flag; wait_disconnected()
         # only completes after socket/channel cleanup, which can take seconds.
+        try:
+            dtx = getattr(session.get("dvt"), "dtx", None)
+        except RuntimeError:
+            # The pinned DvtProvider.dtx raises once the provider has been closed.
+            return False
         return (self.session is session and session.get("valid", True) and
-                not getattr(getattr(session.get("dvt"), "dtx", None), "_closed", False) and
+                not getattr(dtx, "_closed", False) and
                 (not session.get("tunnel") or session["tunnel"].rsd is not None))
 
     def session_event(self, session, error):
